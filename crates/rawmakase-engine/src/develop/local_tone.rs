@@ -208,12 +208,20 @@ impl MapBase {
     /// photo.
     pub(crate) fn new(lum: Vec<f32>, size: [u32; 2], source: [u32; 2]) -> Self {
         let (w, h) = (size[0] as usize, size[1] as usize);
-        let logs: Vec<f32> = lum.iter().map(|y| y.log2()).collect();
-        let percentile = |q: f32| {
+        let logs: Vec<f32> = lum.par_iter().map(|y| y.log2()).collect();
+        // Both keys from one copy: the higher percentile first, then the lower one among
+        // the values below it, which holds the same element.
+        let percentiles = |q: [f32; 2]| -> [f32; 2] {
             let mut v = lum.clone();
-            let k = ((v.len() - 1) as f32 * q) as usize;
-            v.select_nth_unstable_by(k, f32::total_cmp);
-            v[k].log2()
+            let k = q.map(|q| ((v.len() - 1) as f32 * q) as usize);
+            let (lo, hi) = if k[0] <= k[1] { (0, 1) } else { (1, 0) };
+            v.select_nth_unstable_by(k[hi], f32::total_cmp);
+            let high = v[k[hi]];
+            v[..=k[hi]].select_nth_unstable_by(k[lo], f32::total_cmp);
+            let mut out = [0.; 2];
+            out[hi] = high.log2();
+            out[lo] = v[k[lo]].log2();
+            out
         };
         let r = ((RADIUS * w.max(h) as f32).round() as usize).max(1);
         // He et al. guided filter with the image as its own guide.
@@ -231,10 +239,7 @@ impl MapBase {
         let b: Vec<f32> = m.iter().zip(&a).map(|(m, a)| m - a * m).collect();
         let (a, b) = rayon::join(|| mean(&a), || mean(&b));
         // Masks may evaluate either slider, so both keys are kept.
-        let keys = [
-            percentile(SHADOWS.percentile),
-            percentile(HIGHLIGHTS.percentile),
-        ];
+        let keys = percentiles([SHADOWS.percentile, HIGHLIGHTS.percentile]);
         Self {
             width: w,
             height: h,
@@ -297,40 +302,129 @@ pub(crate) fn gpu_families() -> Vec<f32> {
     out.extend(SLIDER_VALUES);
     out
 }
-/// Mean over a (2r+1)² window, clamped at the borders, via running sums.
+/// Mean over a (2r+1)² window, clamped at the borders, via running sums: along rows,
+/// then along columns. Each line keeps its own `f64` running sum, added to in the same
+/// order whatever the parallelism; the columns are swept in blocks, row by row, so
+/// they read memory in order.
 pub(super) fn blur(x: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
-    // One line: `out[i]` for `len` values read through `get`; lines are independent,
-    // so they run in parallel with the same arithmetic.
-    let line = |len: usize, get: &dyn Fn(usize) -> f32| -> Vec<f32> {
-        let get = |i: isize| get(i.clamp(0, len as isize - 1) as usize) as f64;
-        let mut out = vec![0.; len];
-        let mut sum: f64 = (-(r as isize)..=r as isize).map(get).sum();
+    let n = (2 * r + 1) as f64;
+    // The running sum of a line read through `get`, as each line starts it.
+    let start = |len: usize, get: &dyn Fn(usize) -> f64| -> f64 {
+        (-(r as isize)..=r as isize)
+            .map(|i| get(i.clamp(0, len as isize - 1) as usize))
+            .sum()
+    };
+    let mut rows = vec![0f32; x.len()];
+    rows.par_chunks_mut(w).enumerate().for_each(|(y, out)| {
+        let line = &x[y * w..y * w + w];
+        let get = |i: isize| line[i.clamp(0, w as isize - 1) as usize] as f64;
+        let mut sum = start(w, &|i| line[i] as f64);
         for (i, v) in out.iter_mut().enumerate() {
-            *v = (sum / (2 * r + 1) as f64) as f32;
+            *v = (sum / n) as f32;
             sum += get(i as isize + r as isize + 1) - get(i as isize - r as isize);
         }
-        out
-    };
-    let rows: Vec<f32> = (0..h)
-        .into_par_iter()
-        .flat_map_iter(|y| line(w, &|i| x[y * w + i]))
-        .collect();
-    let columns: Vec<Vec<f32>> = (0..w)
-        .into_par_iter()
-        .map(|c| line(h, &|i| rows[i * w + c]))
-        .collect();
-    let mut out = vec![0.; x.len()];
-    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        for (c, v) in row.iter_mut().enumerate() {
-            *v = columns[c][y];
-        }
     });
+    const BLOCK: usize = 64;
+    let mut out = vec![0f32; x.len()];
+    let blocks: Vec<(usize, Vec<f32>)> = (0..w.div_ceil(BLOCK))
+        .into_par_iter()
+        .map(|b| {
+            let (c0, c1) = (b * BLOCK, ((b + 1) * BLOCK).min(w));
+            let get = |y: isize, c: usize| rows[y.clamp(0, h as isize - 1) as usize * w + c] as f64;
+            let mut sums: Vec<f64> = (c0..c1)
+                .map(|c| start(h, &|y| rows[y * w + c] as f64))
+                .collect();
+            let mut block = vec![0f32; (c1 - c0) * h];
+            for y in 0..h {
+                for (k, sum) in sums.iter_mut().enumerate() {
+                    block[y * (c1 - c0) + k] = (*sum / n) as f32;
+                    *sum += get(y as isize + r as isize + 1, c0 + k)
+                        - get(y as isize - r as isize, c0 + k);
+                }
+            }
+            (c0, block)
+        })
+        .collect();
+    for (c0, block) in blocks {
+        let width = block.len() / h.max(1);
+        for y in 0..h {
+            out[y * w + c0..y * w + c0 + width].copy_from_slice(&block[y * width..(y + 1) * width]);
+        }
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The blur as first written, line by line: the reference the faster one keeps to.
+    fn reference_blur(x: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+        // One line: `out[i]` for `len` values read through `get`; lines are independent,
+        // so they run in parallel with the same arithmetic.
+        let line = |len: usize, get: &dyn Fn(usize) -> f32| -> Vec<f32> {
+            let get = |i: isize| get(i.clamp(0, len as isize - 1) as usize) as f64;
+            let mut out = vec![0.; len];
+            let mut sum: f64 = (-(r as isize)..=r as isize).map(get).sum();
+            for (i, v) in out.iter_mut().enumerate() {
+                *v = (sum / (2 * r + 1) as f64) as f32;
+                sum += get(i as isize + r as isize + 1) - get(i as isize - r as isize);
+            }
+            out
+        };
+        let rows: Vec<f32> = (0..h)
+            .into_par_iter()
+            .flat_map_iter(|y| line(w, &|i| x[y * w + i]))
+            .collect();
+        let columns: Vec<Vec<f32>> = (0..w)
+            .into_par_iter()
+            .map(|c| line(h, &|i| rows[i * w + c]))
+            .collect();
+        let mut out = vec![0.; x.len()];
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for (c, v) in row.iter_mut().enumerate() {
+                *v = columns[c][y];
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn both_keys_are_the_percentiles_selected_on_their_own() {
+        let lum: Vec<f32> = (0..5000)
+            .map(|i| 1e-3 + ((i * 7919) % 997) as f32 / 300.)
+            .collect();
+        let alone = |q: f32| {
+            let mut v = lum.clone();
+            let k = ((v.len() - 1) as f32 * q) as usize;
+            v.select_nth_unstable_by(k, f32::total_cmp);
+            v[k].log2()
+        };
+        let base = MapBase::new(lum.clone(), [100, 50], [100, 50]);
+        assert_eq!(
+            base.keys,
+            [alone(SHADOWS.percentile), alone(HIGHLIGHTS.percentile)]
+        );
+    }
+    #[test]
+    fn the_blur_keeps_the_line_by_line_arithmetic() {
+        // Sizes around the column block, radii from one pixel to wider than the image.
+        for (w, h, r) in [
+            (1, 1, 1),
+            (5, 3, 2),
+            (64, 9, 4),
+            (65, 40, 16),
+            (341, 512, 16),
+            (130, 7, 90),
+        ] {
+            let x: Vec<f32> = (0..w * h)
+                .map(|i| ((i * 7919) % 1000) as f32 / 37. - 11.)
+                .collect();
+            assert!(
+                blur(&x, w, h, r) == reference_blur(&x, w, h, r),
+                "{w}x{h} r={r}"
+            );
+        }
+    }
     #[test]
     fn blur_preserves_constants_and_means() {
         let x = vec![2.; 30];
