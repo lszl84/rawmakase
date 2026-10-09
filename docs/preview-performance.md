@@ -75,7 +75,13 @@ pipeline (`crates/rawmakase-engine/src/develop/stage_cache.rs`), each keyed by t
 - the local-tone image: the blurs with Clarity, Texture and, before engine 4,
   Shadows and Highlights applied;
 - samples: each output pixel's camera value after geometry, lens correction and
-  noise reduction, and its source position.
+  noise reduction, and its source position;
+- the photo's measures and the engine 4 Shadows/Highlights map's base: the Contrast
+  pivot, the highlights positive Whites follows, and the guided filter's coefficients
+  and image keys. All come from the reduced photo through the tone stage, so they are
+  keyed by what the tone stage reads (`ToneKey`: white balance, profile, calibration,
+  exposure; the pivot without the user's Exposure). Contrast, Whites, Blacks, Shadows
+  and Highlights come after it and only rebuild their curves.
 
 Exposure, curve, HSL, grading and Engine 4 Shadows/Highlights edits therefore rerun
 only the per-pixel stage; Clarity and Texture edits reuse the blurs. Two entries are
@@ -169,7 +175,34 @@ Highlights and Clarity as above. Presented times, until the frame can be drawn:
 Without local adjustments a reduced render is several times faster. With them, the
 CPU work per render that does not depend on the output size (the Shadows/Highlights
 map, the contrast measure, the histogram readback) dominates, and a reduced render
-saves less; that work is the next target on slow machines.
+saves less.
+
+`examples/slider_benchmark` times what the desktop does while each Basic slider is
+dragged at Fit: a frame presented for each new value, from a new photo's recipe with
+Contrast −76 and Highlights −3, on the 934 × 1402 Fit and the half-size draft. On the
+same laptop and photo, per change, the time spent before the per-pixel stage was:
+
+| Stage, per change | Before | Measures and map kept |
+| --- | ---: | ---: |
+| Contrast pivot, measured on the CPU | 47 ms | kept |
+| Reduced photo toned on the GPU and read back | 6 ms | kept |
+| Guided filter and keys on the CPU | 19 ms | kept |
+| Parameters (curves, tables) | <1 ms | 5 ms with the map's upload |
+
+Presented per change, median of 12, in two runs of each build interleaved (the machine
+was shared with other work):
+
+| Slider | Fit before | Fit after | Draft before | Draft after |
+| --- | ---: | ---: | ---: | ---: |
+| Exposure | 136–148 ms | 72–77 ms | 111–112 ms | 43–53 ms |
+| Contrast | 146–149 ms | 58 ms | 123–124 ms | 21 ms |
+| Highlights | 146–150 ms | 59 ms | 124 ms | 22 ms |
+| Shadows | 151–152 ms | 53–59 ms | 124–125 ms | 16–22 ms |
+| Whites | 120–135 ms | 59–75 ms | 151–157 ms | 22–23 ms |
+| Blacks | 150–155 ms | 67–72 ms | 126–128 ms | 20–23 ms |
+
+Exposure changes the tone stage, so it builds the map again (about 30 ms). What is left
+for the other sliders is the per-pixel stage and its finish on the GPU.
 
 ## GPU develop stage
 

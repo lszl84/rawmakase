@@ -194,15 +194,35 @@ pub(crate) fn needs_reduced(r: &Recipe) -> bool {
 }
 /// Parameters that stop after the tone stage (`tone_stage`, before the map), to tone
 /// the reduced photo the Shadows/Highlights map is built from on the GPU.
+#[cfg(test)]
 pub(crate) fn tone_params(im: Source, r: &Recipe) -> Option<PixelParams> {
     if !supported(r) {
         return None;
     }
     let matrix = profile_matrix(&im.metadata, r);
-    // The same parameters run the final pass once the map is built (`with_map`), so
-    // they carry this photo's Contrast pivot.
     let mut p = fill(r, CurveSet::with_photo_measures(im, r, matrix), matrix)?;
     p.set("TONE_ONLY", &[1.]);
+    Some(p)
+}
+/// Parameters with the photo's measures already taken, for a recipe whose per-pixel
+/// stage needs no Shadows/Highlights map (see [`needs_map`]); `tone_only` stops them
+/// after the tone stage, to tone the reduced photo the map is built from. The same
+/// parameters then run the final pass (`with_map`), so they carry the photo's Contrast
+/// pivot.
+pub(crate) fn measured_params(
+    im: Source,
+    r: &Recipe,
+    measures: super::PhotoMeasures,
+    tone_only: bool,
+) -> Option<PixelParams> {
+    if !supported(r) {
+        return None;
+    }
+    let matrix = profile_matrix(&im.metadata, r);
+    let mut p = fill(r, CurveSet::with_measures(r, measures), matrix)?;
+    if tone_only {
+        p.set("TONE_ONLY", &[1.]);
+    }
     Some(p)
 }
 fn set_local(p: &mut PixelParams, local: &LocalToneMap) {

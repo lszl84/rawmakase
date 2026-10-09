@@ -129,48 +129,28 @@ impl LocalToneMap {
         source: [u32; 2],
         sliders: Sliders,
     ) -> Self {
-        let (w, h) = (size[0] as usize, size[1] as usize);
-        let logs: Vec<f32> = lum.iter().map(|y| y.log2()).collect();
-        let percentile = |q: f32| {
-            let mut v = lum.clone();
-            let k = ((v.len() - 1) as f32 * q) as usize;
-            v.select_nth_unstable_by(k, f32::total_cmp);
-            v[k].log2()
-        };
-        let r = ((RADIUS * w.max(h) as f32).round() as usize).max(1);
-        // He et al. guided filter with the image as its own guide.
-        let mean = |x: &[f32]| blur(x, w, h, r);
-        let sq: Vec<f32> = logs.iter().map(|v| v * v).collect();
-        let (m, m2) = rayon::join(|| mean(&logs), || mean(&sq));
-        let a: Vec<f32> = m
-            .iter()
-            .zip(&m2)
-            .map(|(m, m2)| {
-                let var = (m2 - m * m).max(0.);
-                var / (var + EPSILON)
-            })
-            .collect();
-        let b: Vec<f32> = m.iter().zip(&a).map(|(m, a)| m - a * m).collect();
-        let (a, b) = rayon::join(|| mean(&a), || mean(&b));
-        // Masks may evaluate either slider, so both keys are kept.
-        let keys = [
-            percentile(SHADOWS.percentile),
-            percentile(HIGHLIGHTS.percentile),
-        ];
+        Self::from_base(&MapBase::new(lum, size, source), sliders)
+    }
+    /// The map of `base` at these slider values: only the curves and the measured
+    /// Clarity depend on them.
+    pub(crate) fn from_base(base: &MapBase, sliders: Sliders) -> Self {
+        let (w, h) = (base.width, base.height);
+        let keys = base.keys;
         let clarity = (sliders.clarity > 0.).then(|| {
-            let base: Vec<f32> = logs
+            let level: Vec<f32> = base
+                .logs
                 .iter()
-                .zip(a.iter().zip(&b))
+                .zip(base.a.iter().zip(&base.b))
                 .map(|(l, (a, b))| a * l + b)
                 .collect();
-            super::clarity::field(&logs, &base, w, h, keys[0], sliders.clarity)
+            super::clarity::field(&base.logs, &level, w, h, keys[0], sliders.clarity)
         });
         Self {
             width: w,
             height: h,
-            a,
-            b,
-            scale: [w as f32 / source[0] as f32, h as f32 / source[1] as f32],
+            a: base.a.clone(),
+            b: base.b.clone(),
+            scale: base.scale,
             shadows: Curve::new(&SHADOWS, sliders.shadows, keys[0]),
             highlights: Curve::new(&HIGHLIGHTS, sliders.highlights, keys[1]),
             keys,
@@ -209,6 +189,65 @@ impl LocalToneMap {
         let top = v[iy * self.width + ix] * (1. - tx) + v[iy * self.width + jx] * tx;
         let bottom = v[jy * self.width + ix] * (1. - tx) + v[jy * self.width + jx] * tx;
         top * (1. - ty) + bottom * ty
+    }
+}
+/// What the map takes from the photo, whatever the sliders: the guided filter's
+/// coefficients and the image keys. Built from the reduced photo toned at the recipe's
+/// exposure, so the Shadows, Highlights and Clarity sliders reuse it.
+pub(crate) struct MapBase {
+    width: usize,
+    height: usize,
+    logs: Vec<f32>,
+    a: Vec<f32>,
+    b: Vec<f32>,
+    scale: [f32; 2],
+    keys: [f32; 2],
+}
+impl MapBase {
+    /// From the luminance of the reduced photo toned, `size` pixels of a `source`-sized
+    /// photo.
+    pub(crate) fn new(lum: Vec<f32>, size: [u32; 2], source: [u32; 2]) -> Self {
+        let (w, h) = (size[0] as usize, size[1] as usize);
+        let logs: Vec<f32> = lum.iter().map(|y| y.log2()).collect();
+        let percentile = |q: f32| {
+            let mut v = lum.clone();
+            let k = ((v.len() - 1) as f32 * q) as usize;
+            v.select_nth_unstable_by(k, f32::total_cmp);
+            v[k].log2()
+        };
+        let r = ((RADIUS * w.max(h) as f32).round() as usize).max(1);
+        // He et al. guided filter with the image as its own guide.
+        let mean = |x: &[f32]| blur(x, w, h, r);
+        let sq: Vec<f32> = logs.iter().map(|v| v * v).collect();
+        let (m, m2) = rayon::join(|| mean(&logs), || mean(&sq));
+        let a: Vec<f32> = m
+            .iter()
+            .zip(&m2)
+            .map(|(m, m2)| {
+                let var = (m2 - m * m).max(0.);
+                var / (var + EPSILON)
+            })
+            .collect();
+        let b: Vec<f32> = m.iter().zip(&a).map(|(m, a)| m - a * m).collect();
+        let (a, b) = rayon::join(|| mean(&a), || mean(&b));
+        // Masks may evaluate either slider, so both keys are kept.
+        let keys = [
+            percentile(SHADOWS.percentile),
+            percentile(HIGHLIGHTS.percentile),
+        ];
+        Self {
+            width: w,
+            height: h,
+            logs,
+            a,
+            b,
+            scale: [w as f32 / source[0] as f32, h as f32 / source[1] as f32],
+            keys,
+        }
+    }
+    /// Memory held, for the stage cache's budget.
+    pub(crate) fn bytes(&self) -> usize {
+        (self.logs.len() + self.a.len() + self.b.len()) * 4
     }
 }
 /// The measured positions a slider is bracketed in, as `Curve::new` builds them: each
