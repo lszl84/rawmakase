@@ -24,6 +24,9 @@ const FIELDS: &[(&str, usize)] = &[
     ("ENH_CURVE", 1),
     ("TONE", 1),
     ("TONE_COUNT", 1),
+    // 1 when the tone curve's knots are at i / (count - 1), as Adobe's are: the shader
+    // then indexes the curve instead of searching it.
+    ("TONE_UNIFORM", 1),
     ("LOCAL", 1),
     ("LOCAL_SIZE", 2),
     ("LOCAL_SCALE", 2),
@@ -99,6 +102,10 @@ pub(crate) struct PixelParams {
     /// Mask weights, four bytes per word, `MASK_WORDS` words per pixel; empty
     /// without masks.
     pub(crate) weights: Vec<u32>,
+    /// The recipe as the tone stage reads it, when the develop pass may keep the tone
+    /// stage's output for its samples and reuse it while only the stages after it
+    /// change (see `gpu::develop::Kept`). `None` runs the tone stage every time.
+    pub(crate) tone: Option<Recipe>,
 }
 impl PixelParams {
     fn set(&mut self, name: &str, values: &[f32]) {
@@ -142,6 +149,16 @@ impl PixelParams {
             &[at, a as f32, b as f32, c as f32, t.srgb() as u8 as f32],
         );
     }
+}
+/// Whether a piecewise-linear curve's knots sit at i / (n - 1), so the knot at or
+/// below `x` is the one at `floor(x * (n - 1))`.
+fn uniform_knots(curve: &[[f32; 2]]) -> bool {
+    let n = curve.len();
+    n >= 2
+        && curve
+            .iter()
+            .enumerate()
+            .all(|(i, p)| p[0] == i as f32 / (n - 1) as f32)
 }
 /// Whether the GPU port renders this (resolved) recipe.
 pub(crate) fn supported(r: &Recipe) -> bool {
@@ -290,6 +307,7 @@ fn fill(r: &Recipe, lut: CurveSet, matrix: [[f32; 3]; 3]) -> Option<PixelParams>
     let mut p = PixelParams {
         params: vec![0.; len],
         tables: Vec::new(),
+        tone: None,
         weights: Vec::new(),
     };
     p.set("CAMERA", matrix.as_flattened());
@@ -318,6 +336,7 @@ fn fill(r: &Recipe, lut: CurveSet, matrix: [[f32; 3]; 3]) -> Option<PixelParams>
     let tone = p.push(t.tone.iter().flatten().copied());
     p.set("TONE", &[tone]);
     p.set("TONE_COUNT", &[t.tone.len() as f32]);
+    p.set("TONE_UNIFORM", &[uniform_knots(t.tone) as u8 as f32]);
     p.set("EXPOSURE_EV", &[r.exposure + r.camera_exposure]);
     p.set("GLOBAL_SH", &[r.shadows, r.highlights]);
     if let Some(local) = &lut.local {

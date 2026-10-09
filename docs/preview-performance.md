@@ -204,6 +204,36 @@ was shared with other work):
 Exposure changes the tone stage, so it builds the map again (about 30 ms). What is left
 for the other sliders is the per-pixel stage and its finish on the GPU.
 
+The GPU passes of a presented Fit, timed by submitting each on its own (same laptop,
+934 × 1402): develop 23 ms, sharpening 5 ms, and finishing 24 ms, of which nearly all
+was the histogram. Every pixel added to the 774 shared counters with global atomics,
+which serialised on this GPU. Each workgroup now counts into its own copy in
+workgroup memory and adds it once: finishing takes 4 ms (2 ms for the draft), with
+the same counts.
+
+Of the develop pass, about 16 ms was the tone stage (camera profile tables, look
+table and tone curve) and 9 ms what follows it. The tone stage's output per sample
+depends only on the samples and the recipe as the tone stage reads it, so the pass
+keeps it on the device for the last few sample sets (the Fit, its draft and a 100%
+region) and reads it while only the stages after it change: Contrast, Whites, Blacks,
+Shadows, Highlights, curves and colour. It is kept from the second render of a sample
+set with the same tone, so an Exposure drag, where every value is new, does not pay
+for writing it, and only once the pass that writes it is submitted. Mask adjustments
+change the tone stage per pixel, so masked recipes run it every time. The profile tone
+curve's knots are at i / 1024 in Adobe's profiles, so the pass now indexes the curve
+instead of searching it.
+
+With both, per change (median of 12):
+
+| Slider | Fit | Draft |
+| --- | ---: | ---: |
+| Exposure | 69 ms | 47 ms |
+| Contrast | 26 ms | 14 ms |
+| Highlights | 26 ms | 14 ms |
+| Shadows | 26 ms | 14 ms |
+| Whites | 27 ms | 15 ms |
+| Blacks | 27 ms | 14 ms |
+
 ## GPU develop stage
 
 `crates/rawmakase-engine/src/develop/gpu/develop.wgsl` ports the per-pixel stage (`process_pixel`) of the

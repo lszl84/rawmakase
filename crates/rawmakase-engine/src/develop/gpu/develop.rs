@@ -1,6 +1,7 @@
 //! GPU port of the per-pixel color and tone stage (`develop.wgsl`). Samples from the
-//! stage cache stay on the device while only the recipe changes; parameters and tables
-//! are uploaded per render. The result is read back for the CPU finishing steps.
+//! stage cache stay on the device while only the recipe changes, and so does their tone
+//! stage while only the stages after it change (see `Kept`); parameters and tables are
+//! uploaded per render. The result is read back for the CPU finishing steps.
 use super::Processor;
 use crate::develop::pipeline::{Samples, pixel_params::PixelParams};
 use crate::rendered::Rendered;
@@ -27,6 +28,24 @@ pub(super) struct Developer {
     /// Uploaded sample sets, most recently used first, so switching between Fit and
     /// 100% does not upload again.
     samples: Vec<Uploaded>,
+    /// Bound in place of the kept tone stage by passes that do not keep it.
+    no_tone: wgpu::Buffer,
+}
+/// The tone stage's output for one set of samples and the recipe as the tone stage
+/// reads it (`PixelParams::tone`), so renders that change only the stages after it
+/// (the Basic tone sliders, curves, colour) read it instead of running it again.
+pub(super) struct Kept {
+    pixels: wgpu::Buffer,
+    positions: wgpu::Buffer,
+    recipe: crate::model::recipe::Recipe,
+    toned: wgpu::Buffer,
+    /// A submitted pass wrote `toned` for these samples and `recipe`. Until then it is
+    /// written again: a pass recorded but never submitted (a cancelled render) left it
+    /// as it was. `recipe` is the tone of the last render of these samples, written or
+    /// not.
+    written: bool,
+    /// The last recorded pass writes it; marked written once submitted.
+    pending: bool,
 }
 /// Uploaded sample sets kept, and their device memory budget.
 const UPLOADS: usize = 3;
@@ -46,7 +65,7 @@ impl Developer {
             label: Some("Develop"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        let entries: Vec<_> = (0..7)
+        let entries: Vec<_> = (0..8)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -55,7 +74,7 @@ impl Developer {
                         wgpu::BufferBindingType::Uniform
                     } else {
                         wgpu::BufferBindingType::Storage {
-                            read_only: binding != 2,
+                            read_only: binding != 2 && binding != 7,
                         }
                     },
                     has_dynamic_offset: false,
@@ -85,11 +104,18 @@ impl Developer {
             compilation_options: Default::default(),
             cache: None,
         });
+        let no_tone = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("No kept tone stage"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         Self {
             layout,
             camera_layout,
             pipeline,
             samples: Vec::new(),
+            no_tone,
         }
     }
 }
@@ -171,6 +197,39 @@ impl Developer {
         }
     }
 }
+/// What a develop pass does with the kept tone stage of its samples; the value is the
+/// shader's `size.z`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Keep {
+    /// Runs the tone stage.
+    Run = 0,
+    /// Reads the kept tone stage.
+    Read = 1,
+    /// Runs the tone stage and keeps it.
+    Write = 2,
+}
+impl Keep {
+    /// From the samples' entry, when there is one: whether its tone is this render's,
+    /// and whether a submitted pass wrote it. The tone is kept once a second render of
+    /// the samples has the same tone: while Exposure itself moves, every value is new
+    /// and writing it would only add work.
+    pub(super) fn step(entry: Option<(bool, bool)>) -> Self {
+        match entry {
+            Some((true, true)) => Self::Read,
+            Some((true, false)) => Self::Write,
+            _ => Self::Run,
+        }
+    }
+}
+/// Sample sets whose tone stage is kept: the Fit and its draft, and a 100% region.
+const KEPT: usize = 3;
+/// Marks the kept tone stages written once the pass that writes them is submitted.
+pub(super) fn submitted(kept: &mut [Kept]) {
+    for k in kept.iter_mut().filter(|k| k.pending) {
+        k.pending = false;
+        k.written = true;
+    }
+}
 impl Processor {
     /// Uploads CPU samples unless they are on the device already, and records the
     /// develop pass; returns the buffer that holds its result.
@@ -192,6 +251,49 @@ impl Processor {
                 (u.pixels.clone(), u.positions.clone(), u.output.clone())
             }
         };
+        // 1 reads the kept tone stage, 2 runs it and keeps it, 0 runs it.
+        let (mode, toned) = match &params.tone {
+            Some(recipe) if params.weights.is_empty() => {
+                let bytes = n * 12;
+                // The entry for these samples, most recently used first.
+                let found = self
+                    .kept
+                    .iter()
+                    .position(|k| k.pixels == pixels && k.positions == positions);
+                let entry = found.map(|i| self.kept.remove(i));
+                let step = Keep::step(
+                    entry
+                        .as_ref()
+                        .filter(|k| k.toned.size() >= bytes)
+                        .map(|k| (k.recipe == *recipe, k.written)),
+                );
+                let toned = match entry {
+                    Some(k) if k.toned.size() >= bytes => k.toned,
+                    _ => device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Kept tone stage"),
+                        size: bytes,
+                        usage: wgpu::BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    }),
+                };
+                self.kept.insert(
+                    0,
+                    Kept {
+                        pixels: pixels.clone(),
+                        positions: positions.clone(),
+                        recipe: recipe.clone(),
+                        toned: toned.clone(),
+                        written: step == Keep::Read,
+                        pending: step == Keep::Write,
+                    },
+                );
+                self.kept.truncate(KEPT);
+                (step as u32, Some(toned))
+            }
+            _ => (0, None),
+        };
+        let developer = self.developer.get_or_insert_with(|| Developer::new(device));
+        let toned = toned.unwrap_or_else(|| developer.no_tone.clone());
         let storage = |label, data: &[f32]| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
@@ -215,7 +317,7 @@ impl Processor {
         let (gx, gy) = (groups.min(max), groups.div_ceil(groups.min(max)));
         let size = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Develop size"),
-            contents: bytemuck::cast_slice(&[n as u32, gx, 0, 0]),
+            contents: bytemuck::cast_slice(&[n as u32, gx, mode, 0]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let entries: Vec<_> = [
@@ -226,6 +328,7 @@ impl Processor {
             &tables,
             &size,
             &weights,
+            &toned,
         ]
         .into_iter()
         .enumerate()
@@ -306,6 +409,7 @@ impl Processor {
         let output = self.record_develop(Input::Device(&input), params, &mut encoder);
         encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, n * 12);
         let submission = super::submit(&self.queue, encoder);
+        submitted(&mut self.kept);
         let (tx, rx) = mpsc::sync_channel(1);
         staging
             .slice(..)
@@ -377,6 +481,7 @@ impl Processor {
         let uploaded = &self.developer.as_ref().unwrap().samples[0];
         encoder.copy_buffer_to_buffer(&uploaded.output, 0, &uploaded.staging, 0, n * 12);
         let submission = super::submit(&self.queue, encoder);
+        submitted(&mut self.kept);
         let (tx, rx) = mpsc::sync_channel(1);
         uploaded
             .staging
@@ -404,5 +509,26 @@ impl Processor {
             height: samples.height,
             pixels,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Keep;
+
+    /// A render reads the kept tone stage only after a submitted pass wrote it for the
+    /// same tone; a pass recorded but never submitted (a cancelled render) leaves it to
+    /// be written again.
+    #[test]
+    fn the_kept_tone_stage_is_read_only_once_a_submitted_pass_wrote_it() {
+        // (same tone as the entry, written): new samples, a new tone, the second
+        // render of a tone, then the third.
+        assert_eq!(Keep::step(None), Keep::Run);
+        assert_eq!(Keep::step(Some((false, true))), Keep::Run);
+        assert_eq!(Keep::step(Some((true, false))), Keep::Write);
+        assert_eq!(Keep::step(Some((true, true))), Keep::Read);
+        // Only `submitted` marks an entry written, so after a writing pass that was
+        // cancelled before submission the entry is still unwritten: written again.
+        assert_eq!(Keep::step(Some((true, false))), Keep::Write);
     }
 }

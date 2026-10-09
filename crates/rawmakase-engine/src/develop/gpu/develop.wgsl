@@ -11,6 +11,9 @@
 @group(0) @binding(5) var<uniform> size: vec4<u32>;
 // Mask weights: one byte per mask, four per word, `P_MASK_WORDS` words per pixel.
 @group(0) @binding(6) var<storage, read> weights: array<u32>;
+// The tone stage's output per sample, kept between renders that change only the stages
+// after it: `size.z` 1 reads it, 2 computes and writes it, 0 neither (see `Kept`).
+@group(0) @binding(7) var<storage, read_write> toned: array<f32>;
 
 const TO_2020 = mat3x3<f32>(
     vec3(0.627404, 0.069097, 0.016391),
@@ -204,6 +207,12 @@ fn tone_eval(v: f32) -> f32 {
     let x = clamp(v, 0.0, 1.0);
     var lo = 0u;
     var hi = n;
+    if p(P_TONE_UNIFORM) != 0.0 {
+        // Knots at i / (n - 1): the last one at or below x, without the search. At a
+        // knot either neighbouring segment gives its value.
+        lo = min(u32(x * f32(n - 1u)), n - 2u) + 1u;
+        hi = lo;
+    }
     while lo < hi {
         let mid = (lo + hi) / 2u;
         if table(base + i32(mid) * 2) <= x {
@@ -908,9 +917,27 @@ fn adjust(lab_in: vec3<f32>) -> vec3<f32> {
     }
     return lab;
 }
-fn process_pixel(sample: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
+fn process_pixel(sample: vec3<f32>, pos: vec2<f32>, i: u32) -> vec3<f32> {
     point_selection = -1.0;
-    // tone_stage
+    var rgb: vec3<f32>;
+    if size.z == 1u {
+        rgb = vec3(toned[i * 3u], toned[i * 3u + 1u], toned[i * 3u + 2u]);
+    } else {
+        rgb = tone_stage(sample);
+        if size.z == 2u {
+            toned[i * 3u] = rgb.x;
+            toned[i * 3u + 1u] = rgb.y;
+            toned[i * 3u + 2u] = rgb.z;
+        }
+    }
+    // Toning the reduced photo for the Shadows/Highlights map (`tone_params`).
+    if p(P_TONE_ONLY) != 0.0 {
+        return rgb;
+    }
+    return after_tone(rgb, pos);
+}
+// pipeline::tone_stage: camera sample to linear display RGB after the profile's tone curve.
+fn tone_stage(sample: vec3<f32>) -> vec3<f32> {
     var wb = vec3(1.0);
     if masked {
         let temp = vec3(p(P_LOCAL_WB), p(P_LOCAL_WB + 1u), p(P_LOCAL_WB + 2u));
@@ -940,11 +967,12 @@ fn process_pixel(sample: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
     }
     let y = max(luma2020(wide), 1e-8);
     wide = wide * y / y;
-    var rgb = profile_finish(FROM_2020 * wide);
-    // Toning the reduced photo for the Shadows/Highlights map (`tone_params`).
-    if p(P_TONE_ONLY) != 0.0 {
-        return rgb;
-    }
+    return profile_finish(FROM_2020 * wide);
+}
+// Everything after the tone stage: the Shadows/Highlights gain, the tone curves and the
+// colour stage.
+fn after_tone(toned_rgb: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
+    var rgb = toned_rgb;
     if p(P_LOCAL) != 0.0 {
         rgb *= local_gain(pos, rgb);
     }
@@ -1024,7 +1052,7 @@ fn develop(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_in
     // Positions outside the photo are uploaded as OUTSIDE; Lightroom shows white there.
     if pos.x > OUTSIDE {
         load_delta(i);
-        out = process_pixel(vec3(samples[i * 3u], samples[i * 3u + 1u], samples[i * 3u + 2u]), pos);
+        out = process_pixel(vec3(samples[i * 3u], samples[i * 3u + 1u], samples[i * 3u + 2u]), pos, i);
     }
     output[i * 3u] = out.x;
     output[i * 3u + 1u] = out.y;

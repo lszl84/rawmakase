@@ -416,6 +416,10 @@ impl ReducedKey {
         }
     }
 }
+/// The recipe as the engine 4 tone stage reads it.
+pub(crate) fn tone_recipe(r: &Recipe) -> Recipe {
+    stage_recipes(r).tone
+}
 /// What the engine 4 tone stage makes of the reduced photo: its Contrast pivot (measured
 /// at the camera's exposure), the highlights positive Whites follows and the
 /// Shadows/Highlights map's base. The photo, its local-tone gain and its image before

@@ -615,6 +615,7 @@ impl Processor {
         );
         ensure!(!cancel.load(Ordering::Relaxed), "Render superseded");
         let submission = super::submit(&self.queue, encoder);
+        super::develop::submitted(&mut self.kept);
         let (tx, rx) = mpsc::channel();
         let map = |buffer: &wgpu::Buffer| {
             let tx = tx.clone();

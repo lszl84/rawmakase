@@ -32,8 +32,13 @@ pub(crate) fn gpu_pixel_params(
         made.map_or_else(|_| measured_highlights(im, r), |v| *v)
     });
     let measures = PhotoMeasures { pivot, highlights };
+    // The final pass may keep its tone stage for its samples (see `PixelParams::tone`).
+    let keep = |mut p: pixel_params::PixelParams| {
+        p.tone = Some(crate::develop::stage_cache::tone_recipe(r));
+        p
+    };
     if !pixel_params::needs_map(r) {
-        return pixel_params::measured_params(im, r, measures, false);
+        return pixel_params::measured_params(im, r, measures, false).map(keep);
     }
     let tone = pixel_params::measured_params(im, r, measures, true)?;
     let base = cache.maps.get_or_try(
@@ -71,7 +76,7 @@ pub(crate) fn gpu_pixel_params(
         &base,
         crate::develop::local_tone::Sliders::of(r),
     );
-    Some(pixel_params::with_map(tone, &map))
+    Some(keep(pixel_params::with_map(tone, &map)))
 }
 /// Lens correction for `gpu/local.wgsl`, from `S_LENS` to `S_VIGNETTING_AMOUNT`, with
 /// radial tables appended to `tables` (each: knots, then values) at offsets counted
