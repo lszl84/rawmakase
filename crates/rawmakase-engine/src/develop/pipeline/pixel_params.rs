@@ -108,6 +108,20 @@ pub(crate) struct PixelParams {
     pub(crate) tone: Option<Recipe>,
 }
 impl PixelParams {
+    /// Parameters of zeros but for `values`, without tables.
+    #[cfg(test)]
+    pub(crate) fn with(values: &[(&str, &[f32])]) -> Self {
+        let mut p = Self {
+            params: vec![0.; FIELDS.iter().map(|f| f.1).sum()],
+            tables: Vec::new(),
+            weights: Vec::new(),
+            tone: None,
+        };
+        for (name, v) in values {
+            p.set(name, v);
+        }
+        p
+    }
     fn set(&mut self, name: &str, values: &[f32]) {
         let mut at = 0;
         for (field, len) in FIELDS {
@@ -121,7 +135,6 @@ impl PixelParams {
         unreachable!("Unknown parameter {name}");
     }
     /// The values of parameter `name`.
-    #[cfg(test)]
     pub(crate) fn get(&self, name: &str) -> &[f32] {
         let mut at = 0;
         for (field, len) in FIELDS {
@@ -370,13 +383,18 @@ fn fill(r: &Recipe, lut: CurveSet, matrix: [[f32; 3]; 3]) -> Option<PixelParams>
         None => -1.,
     };
     p.set("PARAMETRIC_LUT", &[parametric]);
-    let master = p.push(lut.master.values().iter().copied());
+    // A straight point curve maps each value to itself: -1 skips its table.
+    let straight = |c: &crate::color::curve::ToneCurve| c.points == [[0., 0.], [1., 1.]];
+    let master = match straight(&r.curve) {
+        true => -1.,
+        false => p.push(lut.master.values().iter().copied()),
+    };
     p.set("MASTER", &[master]);
     p.set("REFINE_SATURATION", &[r.curve_saturation.clamp(0., 1.)]);
-    let channels = lut
-        .channels
-        .each_ref()
-        .map(|c| p.push(c.values().iter().copied()));
+    let channels: [f32; 3] = std::array::from_fn(|c| match straight(&r.effects.channels[c]) {
+        true => -1.,
+        false => p.push(lut.channels[c].values().iter().copied()),
+    });
     p.set("CHANNELS", &channels);
     let mixer = match &lut.mixer {
         Some(m) => p.push(m.delta.iter().flatten().copied()),

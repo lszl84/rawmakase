@@ -63,6 +63,9 @@ fn load_delta(i: u32) {
     for (var k = 0u; k < LOCAL_LEN; k++) {
         delta[k] = 0.0;
     }
+    if !V_MASKS {
+        return;
+    }
     let n = u32(p(P_MASKS));
     if n == 0u {
         return;
@@ -454,7 +457,7 @@ fn local_gain(pos: vec2<f32>, rgb: vec3<f32>) -> f32 {
         let bottom = table(c + i32(jy * w + ix)) * (1.0 - tx) + table(c + i32(jy * w + jx)) * tx;
         clarity = top * (1.0 - ty) + bottom * ty;
     }
-    if masked && (delta[L_SHADOWS] != 0.0 || delta[L_HIGHLIGHTS] != 0.0) {
+    if V_MASKS && masked && (delta[L_SHADOWS] != 0.0 || delta[L_HIGHLIGHTS] != 0.0) {
         let s = p(P_GLOBAL_SH) + delta[L_SHADOWS];
         let h = p(P_GLOBAL_SH + 1u) + delta[L_HIGHLIGHTS];
         return exp2(family(0u, s, p(P_LOCAL_KEYS), base)
@@ -526,7 +529,7 @@ fn reference_curves(rgb: vec3<f32>) -> vec3<f32> {
         let hi = max(max(max(q.x, q.y), q.z), 0.0);
         q = rgb_tone_values(q, lut(basic, 1024u, lo), lut(basic, 1024u, hi), lo, hi);
     }
-    if masked && (delta[L_CONTRAST] != 0.0 || delta[L_WHITES] != 0.0 || delta[L_BLACKS] != 0.0
+    if V_MASKS && masked && (delta[L_CONTRAST] != 0.0 || delta[L_WHITES] != 0.0 || delta[L_BLACKS] != 0.0
         || delta[L_DEHAZE] != 0.0) {
         q = clamp(q, vec3(0.0), vec3(1.0));
         let lo = min(min(q.x, q.y), q.z);
@@ -540,21 +543,26 @@ fn reference_curves(rgb: vec3<f32>) -> vec3<f32> {
         let hi = max(max(max(q.x, q.y), q.z), 0.0);
         q = rgb_tone_values(q, lut(parametric, 1024u, lo), lut(parametric, 1024u, hi), lo, hi);
     }
-    let lo = min(min(q.x, q.y), q.z);
-    let hi = max(max(max(q.x, q.y), q.z), 0.0);
+    // Straight master and channel curves (offset -1) map each value to itself.
+    var m = q;
     let master = offset(P_MASTER);
-    let a = lut(master, 4096u, lo);
-    let b = lut(master, 4096u, hi);
-    var m = vec3(a);
-    if hi - lo > 1e-8 {
-        m = a + (b - a) * (q - lo) / (hi - lo);
+    if master >= 0 {
+        let lo = min(min(q.x, q.y), q.z);
+        let hi = max(max(max(q.x, q.y), q.z), 0.0);
+        let a = lut(master, 4096u, lo);
+        let b = lut(master, 4096u, hi);
+        m = vec3(a);
+        if hi - lo > 1e-8 {
+            m = a + (b - a) * (q - lo) / (hi - lo);
+        }
+        m = refine_saturation(q, m);
     }
-    m = refine_saturation(q, m);
-    let channels = vec3(
-        srgb_decode(lut(offset(P_CHANNELS), 4096u, m.x)),
-        srgb_decode(lut(offset(P_CHANNELS + 1u), 4096u, m.y)),
-        srgb_decode(lut(offset(P_CHANNELS + 2u), 4096u, m.z)),
-    );
+    var channels: vec3<f32>;
+    for (var c = 0u; c < 3u; c++) {
+        let table = offset(P_CHANNELS + c);
+        let v = select(m[c], lut(table, 4096u, m[c]), table >= 0);
+        channels[c] = srgb_decode(v);
+    }
     return PRO_TO_RGB * channels;
 }
 // color_mixer::ColorMixer (36 hues × 6 saturations × 6 values).
@@ -917,29 +925,24 @@ fn adjust(lab_in: vec3<f32>) -> vec3<f32> {
     }
     return lab;
 }
-fn process_pixel(sample: vec3<f32>, pos: vec2<f32>, i: u32) -> vec3<f32> {
+fn process_pixel(sample: vec3<f32>, i: u32) -> vec3<f32> {
     point_selection = -1.0;
-    var rgb: vec3<f32>;
-    if size.z == 1u {
-        rgb = vec3(toned[i * 3u], toned[i * 3u + 1u], toned[i * 3u + 2u]);
-    } else {
-        rgb = tone_stage(sample);
-        if size.z == 2u {
-            toned[i * 3u] = rgb.x;
-            toned[i * 3u + 1u] = rgb.y;
-            toned[i * 3u + 2u] = rgb.z;
-        }
+    let rgb = tone_stage(sample);
+    if size.z == 2u {
+        toned[i * 3u] = rgb.x;
+        toned[i * 3u + 1u] = rgb.y;
+        toned[i * 3u + 2u] = rgb.z;
     }
     // Toning the reduced photo for the Shadows/Highlights map (`tone_params`).
     if p(P_TONE_ONLY) != 0.0 {
         return rgb;
     }
-    return after_tone(rgb, pos);
+    return after_tone(rgb, i);
 }
 // pipeline::tone_stage: camera sample to linear display RGB after the profile's tone curve.
 fn tone_stage(sample: vec3<f32>) -> vec3<f32> {
     var wb = vec3(1.0);
-    if masked {
+    if V_MASKS && masked {
         let temp = vec3(p(P_LOCAL_WB), p(P_LOCAL_WB + 1u), p(P_LOCAL_WB + 2u));
         let tint = vec3(p(P_LOCAL_WB + 3u), p(P_LOCAL_WB + 4u), p(P_LOCAL_WB + 5u));
         wb = exp2(delta[L_TEMPERATURE] * temp + delta[L_TINT] * tint);
@@ -952,14 +955,14 @@ fn tone_stage(sample: vec3<f32>) -> vec3<f32> {
     }
     let color = calibrate(PRO_TO_RGB * pro * p(P_PROFILE_SCALE));
     var wide = TO_2020 * color;
-    if masked {
+    if V_MASKS && masked {
         let exposure = exp2(delta[L_EXPOSURE]);
         let tint = exp2(vec3(delta[L_COLOR], delta[L_COLOR + 1u], delta[L_COLOR + 2u]));
         wide = wide * p(P_EXPOSURE) * exposure * tint;
     } else {
         wide = wide * p(P_EXPOSURE);
     }
-    if masked && delta[L_EXPOSURE] != 0.0 {
+    if V_MASKS && masked && delta[L_EXPOSURE] != 0.0 {
         let black = 0.0015 * exp2(p(P_EXPOSURE_EV) + delta[L_EXPOSURE]);
         wide = vec3(ramp_with(wide.x, black), ramp_with(wide.y, black), ramp_with(wide.z, black));
     } else {
@@ -971,14 +974,14 @@ fn tone_stage(sample: vec3<f32>) -> vec3<f32> {
 }
 // Everything after the tone stage: the Shadows/Highlights gain, the tone curves and the
 // colour stage.
-fn after_tone(toned_rgb: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
+fn after_tone(toned_rgb: vec3<f32>, i: u32) -> vec3<f32> {
     var rgb = toned_rgb;
-    if p(P_LOCAL) != 0.0 {
-        rgb *= local_gain(pos, rgb);
+    if V_LOCAL && p(P_LOCAL) != 0.0 {
+        rgb *= local_gain(vec2(positions[i * 2u], positions[i * 2u + 1u]), rgb);
     }
     // color_stage
     rgb = reference_curves(rgb);
-    if offset(P_MIXER) >= 0 {
+    if V_COLOR && offset(P_MIXER) >= 0 {
         // SaturationModel::Gray: below −50, a fade to the luminance the color has
         // through the other sliders.
         var source = rgb;
@@ -989,17 +992,17 @@ fn after_tone(toned_rgb: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
         rgb = mixer(rgb, offset(P_MIXER));
         rgb = mix(rgb, vec3(y), p(P_SATURATION_GRAY));
     }
-    if offset(P_POINT) >= 0 {
+    if V_COLOR && offset(P_POINT) >= 0 {
         rgb = point_colors(rgb);
     }
-    if offset(P_RGB) >= 0 && p(P_RGB + 5u) != 0.0 {
+    if V_COLOR && offset(P_RGB) >= 0 && p(P_RGB + 5u) != 0.0 {
         rgb = rgb_table(rgb);
     }
-    if offset(P_GRADE) >= 0 {
+    if V_COLOR && offset(P_GRADE) >= 0 {
         rgb = grade(rgb);
     }
     var lab = srgb_to_lab(rgb);
-    if masked && (delta[L_HUE] != 0.0 || delta[L_SATURATION] != 0.0) {
+    if V_MASKS && masked && (delta[L_HUE] != 0.0 || delta[L_SATURATION] != 0.0) {
         let angle = radians(delta[L_HUE]);
         let k = max(1.0 + delta[L_SATURATION], 0.0);
         let a = lab.y;
@@ -1007,18 +1010,21 @@ fn after_tone(toned_rgb: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
         lab.y = (a * cos(angle) - b * sin(angle)) * k;
         lab.z = (a * sin(angle) + b * cos(angle)) * k;
     }
-    if p(P_ADJUST) != 0.0 {
+    if V_COLOR && p(P_ADJUST) != 0.0 {
         lab = adjust(lab);
     } else {
         lab.x = clamp(lab.x, 0.0, 1.0);
     }
     rgb = lab_to_srgb(lab);
-    lab = srgb_to_lab(rgb);
-    let l = clamp(lab.x, 0.0, 1.0);
-    let gray = l * l * l;
-    var gamut = 1.0;
-    // GamutModel::Clip: each channel clipped on its own, as Camera Raw does.
+    // GamutModel::Clip: each channel clipped on its own, as Camera Raw does; the
+    // compression's gray is only needed without it.
     let clip = p(P_GAMUT_CLIP) != 0.0;
+    var gray = 0.0;
+    if !clip {
+        let l = clamp(srgb_to_lab(rgb).x, 0.0, 1.0);
+        gray = l * l * l;
+    }
+    var gamut = 1.0;
     for (var k = 0; k < 3; k++) {
         if clip {
             break;
@@ -1035,7 +1041,7 @@ fn after_tone(toned_rgb: vec3<f32>, pos: vec2<f32>) -> vec3<f32> {
     for (var k = 0; k < 3; k++) {
         out[k] = clamp(srgb_encode(select(gray + (rgb[k] - gray) * gamut, clamp(rgb[k], 0.0, 1.0), clip)), 0.0, 1.0);
     }
-    if point_selection >= 0.0 {
+    if V_COLOR && point_selection >= 0.0 {
         out = visualize(out);
     }
     return out;
@@ -1047,12 +1053,21 @@ fn develop(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_in
     if i >= size.x {
         return;
     }
-    let pos = vec2(positions[i * 2u], positions[i * 2u + 1u]);
     var out = vec3(1.0);
-    // Positions outside the photo are uploaded as OUTSIDE; Lightroom shows white there.
-    if pos.x > OUTSIDE {
+    if V_READ {
+        // The kept tone stage: neither the samples nor (without the map) their
+        // positions are read. Samples outside the photo were kept as OUTSIDE.
+        point_selection = -1.0;
+        let rgb = vec3(toned[i * 3u], toned[i * 3u + 1u], toned[i * 3u + 2u]);
+        if rgb.x > OUTSIDE {
+            out = after_tone(rgb, i);
+        }
+    } else if positions[i * 2u] > OUTSIDE {
+        // Positions outside the photo are uploaded as OUTSIDE; Lightroom shows white there.
         load_delta(i);
-        out = process_pixel(vec3(samples[i * 3u], samples[i * 3u + 1u], samples[i * 3u + 2u]), pos, i);
+        out = process_pixel(vec3(samples[i * 3u], samples[i * 3u + 1u], samples[i * 3u + 2u]), i);
+    } else if size.z == 2u {
+        toned[i * 3u] = OUTSIDE;
     }
     output[i * 3u] = out.x;
     output[i * 3u + 1u] = out.y;

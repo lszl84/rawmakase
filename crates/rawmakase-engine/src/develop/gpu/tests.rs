@@ -889,11 +889,26 @@ fn shaders_are_valid_wgsl() {
         front::wgsl,
         valid::{Capabilities, ValidationFlags, Validator},
     };
-    let prelude = crate::develop::pipeline::pixel_params::wgsl_prelude();
-    let modules: [(&str, String, &[&str]); 6] = [
+    let prelude = crate::develop::pipeline::pixel_params::wgsl_prelude()
+        + &super::develop::Variant::FULL.constants();
+    // The leanest develop variant leaves out every feature it can.
+    let lean = crate::develop::pipeline::pixel_params::wgsl_prelude()
+        + &super::develop::Variant {
+            read: true,
+            masks: false,
+            color: false,
+            local: false,
+        }
+        .constants();
+    let modules: [(&str, String, &[&str]); 7] = [
         (
             "develop.wgsl",
             prelude.clone() + include_str!("develop.wgsl"),
+            &["develop"],
+        ),
+        (
+            "develop.wgsl, lean variant",
+            lean + include_str!("develop.wgsl"),
             &["develop"],
         ),
         (

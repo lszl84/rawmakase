@@ -19,12 +19,61 @@ const GROUP: u32 = 256;
 /// rather than NaN, which shader compilers may assume never occurs.
 const OUTSIDE: f32 = -3e38;
 
+/// Which features a develop pipeline is compiled with: `develop.wgsl` tests them as
+/// constants, so a pipeline without one leaves its code out. The full shader compiled
+/// to 12,900 instructions, which an Intel UHD 620 could only run eight pixels at a
+/// time; a pass that needs less of it runs a smaller program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Variant {
+    /// Reads the kept tone stage (`Keep::Read`) instead of running it.
+    pub(crate) read: bool,
+    /// Mask adjustments.
+    pub(crate) masks: bool,
+    /// The colour mixer, Point Color, a look's RGB table, colour grading, the Oklab
+    /// colour controls and black & white.
+    pub(crate) color: bool,
+    /// The Shadows/Highlights map.
+    pub(crate) local: bool,
+}
+impl Variant {
+    /// Everything, for passes that share the shader's functions.
+    pub(crate) const FULL: Self = Self {
+        read: false,
+        masks: true,
+        color: true,
+        local: true,
+    };
+    /// The WGSL constants `develop.wgsl` reads.
+    pub(crate) fn constants(self) -> String {
+        format!(
+            "const V_READ: bool = {};\nconst V_MASKS: bool = {};\nconst V_COLOR: bool = {};\nconst V_LOCAL: bool = {};\n",
+            self.read, self.masks, self.color, self.local
+        )
+    }
+    /// What a pass with `params` needs, reading the kept tone stage or not.
+    fn of(params: &PixelParams, read: bool) -> Self {
+        let set = |name: &str| params.get(name)[0] != 0.;
+        let at = |name: &str| params.get(name)[0] >= 0.;
+        Self {
+            read,
+            masks: !params.weights.is_empty(),
+            color: at("MIXER")
+                || at("POINT")
+                || (at("RGB") && params.get("RGB")[5] != 0.)
+                || at("GRADE")
+                || set("ADJUST"),
+            local: set("LOCAL"),
+        }
+    }
+}
 pub(super) struct Developer {
     pub(super) layout: wgpu::BindGroupLayout,
     /// The layout without the mask weights, for passes that only share the camera
     /// stage (`logs.wgsl`) and must stay within eight storage buffers.
     pub(super) camera_layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
+    /// Develop pipelines compiled so far, one per variant.
+    pipelines: Vec<(Variant, wgpu::ComputePipeline)>,
+    pipeline_layout: wgpu::PipelineLayout,
     /// Uploaded sample sets, most recently used first, so switching between Fit and
     /// 100% does not upload again.
     samples: Vec<Uploaded>,
@@ -59,12 +108,6 @@ struct Uploaded {
 }
 impl Developer {
     pub(super) fn new(device: &wgpu::Device) -> Self {
-        let source =
-            crate::develop::pipeline::pixel_params::wgsl_prelude() + include_str!("develop.wgsl");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Develop"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
         let entries: Vec<_> = (0..8)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -96,14 +139,6 @@ impl Developer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Develop"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("develop"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
         let no_tone = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("No kept tone stage"),
             size: 16,
@@ -113,10 +148,34 @@ impl Developer {
         Self {
             layout,
             camera_layout,
-            pipeline,
+            pipelines: Vec::new(),
+            pipeline_layout,
             samples: Vec::new(),
             no_tone,
         }
+    }
+    /// The develop pipeline for `variant`, compiled on first use.
+    fn pipeline(&mut self, device: &wgpu::Device, variant: Variant) -> wgpu::ComputePipeline {
+        if let Some((_, p)) = self.pipelines.iter().find(|(v, _)| *v == variant) {
+            return p.clone();
+        }
+        let source = crate::develop::pipeline::pixel_params::wgsl_prelude()
+            + &variant.constants()
+            + include_str!("develop.wgsl");
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Develop"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Develop"),
+            layout: Some(&self.pipeline_layout),
+            module: &shader,
+            entry_point: Some("develop"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        self.pipelines.push((variant, pipeline.clone()));
+        pipeline
     }
 }
 /// Samples made on the device (`resident.rs`), and the develop stage's output.
@@ -293,6 +352,7 @@ impl Processor {
             _ => (0, None),
         };
         let developer = self.developer.get_or_insert_with(|| Developer::new(device));
+        let pipeline = developer.pipeline(device, Variant::of(params, mode == Keep::Read as u32));
         let toned = toned.unwrap_or_else(|| developer.no_tone.clone());
         let storage = |label, data: &[f32]| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -347,7 +407,7 @@ impl Processor {
                 label: Some("Develop pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&developer.pipeline);
+            pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
         }
@@ -514,7 +574,39 @@ impl Processor {
 
 #[cfg(test)]
 mod tests {
-    use super::Keep;
+    use super::{Keep, Variant};
+    use crate::develop::pipeline::pixel_params::PixelParams;
+
+    /// Each colour stage on its own compiles the colour code into the pass, and a
+    /// pass without any leaves it out.
+    #[test]
+    fn each_colour_stage_selects_the_colour_variant() {
+        let rgb = [0., 0., 0., 0., 0., 1.];
+        let off = [
+            ("MIXER", &[-1.][..]),
+            ("POINT", &[-1., 0.]),
+            ("RGB", &[-1., 0., 0., 0., 0., 1.]),
+            ("GRADE", &[-1., 0., 0., 0.]),
+            ("ADJUST", &[0.]),
+        ];
+        let colour = |on: Option<(&str, &[f32])>| {
+            let mut values = off.to_vec();
+            values.extend(on);
+            Variant::of(&PixelParams::with(&values), false).color
+        };
+        assert!(!colour(None));
+        // A look's RGB table at zero amount changes nothing.
+        assert!(!colour(Some(("RGB", &[0., 0., 0., 0., 0., 0.]))));
+        for on in [
+            ("MIXER", &[0.][..]),
+            ("POINT", &[0., 0.]),
+            ("RGB", &rgb),
+            ("GRADE", &[0., 0., 0., 0.]),
+            ("ADJUST", &[1.]),
+        ] {
+            assert!(colour(Some(on)), "{}", on.0);
+        }
+    }
 
     /// A render reads the kept tone stage only after a submitted pass wrote it for the
     /// same tone; a pass recorded but never submitted (a cancelled render) leaves it to

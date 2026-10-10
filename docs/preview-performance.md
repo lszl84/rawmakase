@@ -234,6 +234,28 @@ With both, per change (median of 12):
 | Whites | 27 ms | 15 ms |
 | Blacks | 27 ms | 14 ms |
 
+The develop shader carried every stage, and compiled to 12,900 instructions, which
+this GPU ran eight pixels at a time. Each pass now runs a pipeline compiled for what
+its parameters use (`gpu::develop::Variant`): reading the kept tone stage or running
+it, with or without mask adjustments, the colour stages (mixer, Point Color, a look's
+RGB table, colour grading, the Oklab controls) and the Shadows/Highlights map. Without
+masks and colour they compile to about 2,300 instructions, run sixteen pixels at a
+time. A pass reading the kept tone stage no longer reads the samples, nor their
+positions without the map, and straight point curves skip their tables. Finishing
+covers a 4 × 4 block of pixels per invocation, so each workgroup adds its histogram
+once per 64 × 64 tile rather than per 16 × 16.
+
+Per change (median of 16, two runs):
+
+| Slider | Fit | Draft |
+| --- | ---: | ---: |
+| Exposure | 55–60 ms | 38–41 ms |
+| Contrast | 23 ms | 12 ms |
+| Highlights | 23 ms | 13 ms |
+| Shadows | 24 ms | 13 ms |
+| Whites | 23–24 ms | 13–14 ms |
+| Blacks | 24–25 ms | 13–14 ms |
+
 ## GPU develop stage
 
 `crates/rawmakase-engine/src/develop/gpu/develop.wgsl` ports the per-pixel stage (`process_pixel`) of the

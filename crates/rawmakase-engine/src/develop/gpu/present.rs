@@ -555,11 +555,23 @@ impl Processor {
                 .texture
                 .clone();
             let view = plain.create_view(&Default::default());
-            record(&mut encoder, &view, false, &[&present], [cw, ch]);
+            record(
+                &mut encoder,
+                &view,
+                false,
+                &[&present],
+                [cw.div_ceil(4), ch.div_ceil(4)],
+            );
             (plain, view)
         });
         encoder.clear_buffer(&presenter.histogram, 0, None);
-        record(&mut encoder, &view, true, &[&present], [cw, ch]);
+        record(
+            &mut encoder,
+            &view,
+            true,
+            &[&present],
+            [cw.div_ceil(4), ch.div_ceil(4)],
+        );
         let mut reduce = |kind: Kind,
                           source: &wgpu::TextureView,
                           edge: u32,
