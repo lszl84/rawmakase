@@ -68,27 +68,22 @@ impl CurveSet {
     }
     /// Curves with the photo's measures already taken (see [`PhotoMeasures`]).
     pub(crate) fn with_measures(r: &Recipe, measures: PhotoMeasures) -> Self {
-        let mut lut = Self::new(r);
+        let mut photo = Self::photo_tone(r);
         if let Some(pivot) = measures.pivot {
-            lut.photo.contrast = crate::develop::basic_tone::ContrastCurve::Pivot(pivot);
+            photo.contrast = crate::develop::basic_tone::ContrastCurve::Pivot(pivot);
         }
         if let Some(highlights) = measures.highlights {
-            lut.photo.whites = crate::develop::basic_tone::WhitesTable::for_highlights(highlights);
+            photo.whites = crate::develop::basic_tone::WhitesTable::for_highlights(highlights);
         }
-        if measures.pivot.is_some() || measures.highlights.is_some() {
-            lut.basic = crate::develop::basic_tone::BasicTone::new(
-                r.contrast,
-                r.whites,
-                r.blacks,
-                r.effects.dehaze,
-                &lut.photo,
-            );
-        }
-        lut
+        let measured = measures.pivot.is_some() || measures.highlights.is_some();
+        Self::with_photo(r, photo, measured)
     }
     pub(super) fn new(r: &Recipe) -> Self {
-        let basic_curves = r.engine >= 4 && r.reference_curves;
-        let photo = crate::develop::basic_tone::PhotoTone {
+        Self::with_photo(r, Self::photo_tone(r), false)
+    }
+    /// What the Basic curve takes from the photo before it is measured.
+    fn photo_tone(r: &Recipe) -> crate::develop::basic_tone::PhotoTone {
+        crate::develop::basic_tone::PhotoTone {
             contrast: match r.contrast_model {
                 crate::model::operators::ContrastModel::Original => {
                     crate::develop::basic_tone::ContrastCurve::Original
@@ -101,12 +96,21 @@ impl CurveSet {
             },
             // Without the photo, adaptive Whites takes the original median curve.
             whites: crate::develop::basic_tone::WhitesTable::original(),
-        };
+        }
+    }
+    /// The curves with the Basic curve built for `photo`; `measured` builds it even
+    /// where the recipe does not use the reference curves.
+    fn with_photo(
+        r: &Recipe,
+        photo: crate::develop::basic_tone::PhotoTone,
+        measured: bool,
+    ) -> Self {
+        let basic_curves = r.engine >= 4 && r.reference_curves;
         Self {
             output: PixelOutput::Display,
             exposure_gain: 2f32.powf(r.exposure + r.camera_exposure),
             basic_curves,
-            basic: basic_curves
+            basic: (basic_curves || measured)
                 .then(|| {
                     crate::develop::basic_tone::BasicTone::new(
                         r.contrast,

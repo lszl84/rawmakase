@@ -287,6 +287,14 @@ Per change (median of 16, two runs):
 
 The other sliders did not change; these runs were noisier than the previous ones.
 
+Building the parameters on the CPU took about 4.3 ms per render, nearly all of it
+curves: the Basic curve was built twice when the photo was measured (once with the
+typical pivot), its 1025 points each recomputed the pivot's power warp, and the
+point curves evaluated their splines at 4097 points even when straight. The Basic
+curve is now built once, with the warp computed once and its points in parallel,
+and an identity curve's table is written directly; a test checks each gives the same
+bits as before. The parameters now take about 1.3 ms.
+
 ## GPU develop stage
 
 `crates/rawmakase-engine/src/develop/gpu/develop.wgsl` ports the per-pixel stage (`process_pixel`) of the

@@ -426,8 +426,8 @@ fn fill(r: &Recipe, lut: CurveSet, matrix: [[f32; 3]; 3]) -> Option<PixelParams>
         None => -1.,
     };
     p.set("PARAMETRIC_LUT", &[parametric]);
-    // A straight point curve maps each value to itself: -1 skips its table.
-    let straight = |c: &crate::color::curve::ToneCurve| c.points == [[0., 0.], [1., 1.]];
+    // -1 skips the table of a curve that maps each value to itself.
+    let straight = crate::color::curve::ToneCurve::is_identity;
     let master = match straight(&r.curve) {
         true => -1.,
         false => p.push(lut.master.values().iter().copied()),
