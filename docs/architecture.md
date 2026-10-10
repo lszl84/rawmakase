@@ -242,9 +242,11 @@ For the same recipes, the stages before the per-pixel stage also run on the devi
 when the photo fits its buffer limits (`gpu/resident.rs`): the photo or pyramid level
 is kept there with its local-tone blurs, the gain is computed only for the pixels a
 region samples, and regions are sampled there through geometry, lens correction and
-noise reduction. Only the reduced input of the
-Shadows/Highlights map is read back; the map is built on the CPU. A failure in these
-stages turns off only this path for the session.
+noise reduction. The reduced input of the Shadows/Highlights map is read back once
+per photo or pyramid level; the map's base (`gpu/map.rs`) is then built and kept on
+the device for each tone stage, and the develop pass copies it into its tables. With
+the measured Clarity, which needs the base on the CPU, the map is built there. A
+failure in these stages turns off only this path for the session.
 
 Presented textures are kept per view (the whole photo, or a 100% region) and size,
 two of each, so a slider moving alternates between the reduced preview's and the

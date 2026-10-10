@@ -96,6 +96,17 @@ pub(crate) fn wgsl_prelude() -> String {
             "const POINT_CONSTANTS: i32 = {CONSTANT_PARAMS};\nconst POINT_SWATCH: i32 = {SWATCH_PARAMS};\n"
         )
 }
+/// Where parameter `name` starts in `PixelParams::params`, and its length.
+fn field(name: &str) -> (usize, usize) {
+    let mut at = 0;
+    for (field, len) in FIELDS {
+        if *field == name {
+            return (at, *len);
+        }
+        at += len;
+    }
+    unreachable!("Unknown parameter {name}");
+}
 pub(crate) struct PixelParams {
     pub(crate) params: Vec<f32>,
     pub(crate) tables: Vec<f32>,
@@ -106,6 +117,10 @@ pub(crate) struct PixelParams {
     /// stage's output for its samples and reuse it while only the stages after it
     /// change (see `gpu::develop::Kept`). `None` runs the tone stage every time.
     pub(crate) tone: Option<Recipe>,
+    /// The Shadows/Highlights map's base on the device, when it was built there: its
+    /// coefficients follow `tables` and its keys go to `LOCAL_KEYS` as the pass is
+    /// recorded (see [`Self::uploaded`]).
+    pub(crate) map: Option<crate::develop::gpu::DeviceMap>,
 }
 impl PixelParams {
     /// Parameters of zeros but for `values`, without tables.
@@ -116,6 +131,7 @@ impl PixelParams {
             tables: Vec::new(),
             weights: Vec::new(),
             tone: None,
+            map: None,
         };
         for (name, v) in values {
             p.set(name, v);
@@ -123,27 +139,30 @@ impl PixelParams {
         p
     }
     fn set(&mut self, name: &str, values: &[f32]) {
-        let mut at = 0;
-        for (field, len) in FIELDS {
-            if *field == name {
-                assert_eq!(values.len(), *len, "{name}");
-                self.params[at..at + len].copy_from_slice(values);
-                return;
-            }
-            at += len;
-        }
-        unreachable!("Unknown parameter {name}");
+        let (at, len) = field(name);
+        assert_eq!(values.len(), len, "{name}");
+        self.params[at..at + len].copy_from_slice(values);
+    }
+    /// The parameters as the develop pass reads them: with a map on the device, its
+    /// coefficients a and b are placed after the tables.
+    pub(crate) fn uploaded(&self) -> std::borrow::Cow<'_, [f32]> {
+        let Some(map) = &self.map else {
+            return self.params.as_slice().into();
+        };
+        let mut params = self.params.clone();
+        let at = field("LOCAL_A").0;
+        let a = self.tables.len();
+        params[at..at + 2].copy_from_slice(&[a as f32, (a + map.cells()) as f32]);
+        params.into()
+    }
+    /// Where in the parameters, in bytes, a map on the device puts its keys.
+    pub(crate) fn keys_byte_offset() -> u64 {
+        field("LOCAL_KEYS").0 as u64 * 4
     }
     /// The values of parameter `name`.
     pub(crate) fn get(&self, name: &str) -> &[f32] {
-        let mut at = 0;
-        for (field, len) in FIELDS {
-            if *field == name {
-                return &self.params[at..at + len];
-            }
-            at += len;
-        }
-        unreachable!("Unknown parameter {name}");
+        let (at, len) = field(name);
+        &self.params[at..at + len]
     }
     /// Appends a table and returns its offset as a parameter value.
     fn push(&mut self, values: impl IntoIterator<Item = f32>) -> f32 {
@@ -267,10 +286,33 @@ fn set_local(p: &mut PixelParams, local: &LocalToneMap) {
         None => -1.,
     };
     p.set("LOCAL_A", &[a, b, clarity]);
-    for (name, curve) in [
-        ("SHADOWS", &local.shadows),
-        ("HIGHLIGHTS", &local.highlights),
-    ] {
+    set_curves(p, [&local.shadows, &local.highlights]);
+}
+/// `tone` parameters for the whole stage, with the map's base built on the device
+/// from their result, for a `source`-sized photo. Its coefficients and keys are
+/// placed as the pass is recorded; the Clarity measured on the map is not covered.
+pub(crate) fn with_device_map(
+    mut p: PixelParams,
+    map: crate::develop::gpu::DeviceMap,
+    source: [u32; 2],
+    sliders: crate::develop::local_tone::Sliders,
+) -> PixelParams {
+    p.set("TONE_ONLY", &[0.]);
+    p.set("LOCAL", &[1.]);
+    p.set("LOCAL_SIZE", &map.size.map(|v| v as f32));
+    p.set(
+        "LOCAL_SCALE",
+        &crate::develop::local_tone::scale(map.size, source),
+    );
+    p.set("LOCAL_A", &[-1., -1., -1.]);
+    let [shadows, highlights] = crate::develop::local_tone::curves(sliders);
+    set_curves(&mut p, [&shadows, &highlights]);
+    p.map = Some(map);
+    p
+}
+/// The Shadows and Highlights curves; the shader takes their keys from `LOCAL_KEYS`.
+fn set_curves(p: &mut PixelParams, curves: [&Option<crate::develop::local_tone::Curve>; 2]) {
+    for (name, curve) in ["SHADOWS", "HIGHLIGHTS"].into_iter().zip(curves) {
         let values = match curve {
             Some(c) => [p.push(c.table), c.key, c.lo, c.hi],
             None => [-1., 0., 0., 0.],
@@ -322,6 +364,7 @@ fn fill(r: &Recipe, lut: CurveSet, matrix: [[f32; 3]; 3]) -> Option<PixelParams>
         tables: Vec::new(),
         tone: None,
         weights: Vec::new(),
+        map: None,
     };
     p.set("CAMERA", matrix.as_flattened());
     p.set("WB", &r.wb);

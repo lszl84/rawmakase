@@ -10,7 +10,7 @@ use rayon::prelude::*;
 /// Long edge of the reduced image the base level is computed on.
 pub(crate) const MAP_EDGE: u32 = 512;
 const RADIUS: f32 = 0.032;
-const EPSILON: f32 = 1.5;
+pub(crate) const EPSILON: f32 = 1.5;
 
 pub(crate) struct LocalToneMap {
     pub(crate) width: usize,
@@ -211,9 +211,8 @@ impl MapBase {
         let logs: Vec<f32> = lum.par_iter().map(|y| y.log2()).collect();
         // Both keys from one copy: the higher percentile first, then the lower one among
         // the values below it, which holds the same element.
-        let percentiles = |q: [f32; 2]| -> [f32; 2] {
+        let percentiles = |k: [usize; 2]| -> [f32; 2] {
             let mut v = lum.clone();
-            let k = q.map(|q| ((v.len() - 1) as f32 * q) as usize);
             let (lo, hi) = if k[0] <= k[1] { (0, 1) } else { (1, 0) };
             v.select_nth_unstable_by(k[hi], f32::total_cmp);
             let high = v[k[hi]];
@@ -223,7 +222,7 @@ impl MapBase {
             out[lo] = v[k[lo]].log2();
             out
         };
-        let r = ((RADIUS * w.max(h) as f32).round() as usize).max(1);
+        let r = radius(w, h);
         // He et al. guided filter with the image as its own guide.
         let mean = |x: &[f32]| blur(x, w, h, r);
         let sq: Vec<f32> = logs.iter().map(|v| v * v).collect();
@@ -239,21 +238,49 @@ impl MapBase {
         let b: Vec<f32> = m.iter().zip(&a).map(|(m, a)| m - a * m).collect();
         let (a, b) = rayon::join(|| mean(&a), || mean(&b));
         // Masks may evaluate either slider, so both keys are kept.
-        let keys = percentiles([SHADOWS.percentile, HIGHLIGHTS.percentile]);
+        let keys = percentiles(key_ranks(lum.len()));
         Self {
             width: w,
             height: h,
             logs,
             a,
             b,
-            scale: [w as f32 / source[0] as f32, h as f32 / source[1] as f32],
+            scale: scale(size, source),
             keys,
         }
+    }
+    /// The guided filter's coefficients a and b, and the keys.
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> (&[f32], &[f32], [f32; 2]) {
+        (&self.a, &self.b, self.keys)
     }
     /// Memory held, for the stage cache's budget.
     pub(crate) fn bytes(&self) -> usize {
         (self.logs.len() + self.a.len() + self.b.len()) * 4
     }
+}
+/// The Shadows and Highlights curves at `sliders`, for a map whose keys are on the
+/// device: their own keys are 0.
+pub(crate) fn curves(sliders: Sliders) -> [Option<Curve>; 2] {
+    [
+        Curve::new(&SHADOWS, sliders.shadows, 0.),
+        Curve::new(&HIGHLIGHTS, sliders.highlights, 0.),
+    ]
+}
+/// The guided filter's radius on a `w` × `h` grid.
+pub(crate) fn radius(w: usize, h: usize) -> usize {
+    ((RADIUS * w.max(h) as f32).round() as usize).max(1)
+}
+/// The Shadows and Highlights keys' places among `n` luminances sorted ascending.
+pub(crate) fn key_ranks(n: usize) -> [usize; 2] {
+    [SHADOWS.percentile, HIGHLIGHTS.percentile].map(|q| ((n - 1) as f32 * q) as usize)
+}
+/// Map cells per camera-image pixel, for a `size` map of a `source`-sized photo.
+pub(crate) fn scale(size: [u32; 2], source: [u32; 2]) -> [f32; 2] {
+    [
+        size[0] as f32 / source[0] as f32,
+        size[1] as f32 / source[1] as f32,
+    ]
 }
 /// The measured positions a slider is bracketed in, as `Curve::new` builds them: each
 /// position with its table, and the identity at 0 in slot `IDENTITY`.

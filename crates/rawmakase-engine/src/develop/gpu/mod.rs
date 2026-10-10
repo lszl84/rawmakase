@@ -18,12 +18,14 @@ use std::{
 };
 use wgpu::util::DeviceExt;
 mod develop;
+mod map;
 mod present;
 mod resident;
 pub(crate) mod sampling;
 mod uniforms;
 mod weights;
 pub(crate) use develop::Input;
+pub(crate) use map::DeviceMap;
 pub(crate) use present::Finish;
 pub use present::{Display, Frame, MonitorLut, Slot};
 
@@ -90,6 +92,11 @@ pub struct Processor {
     /// The develop stage's tone stage kept for its samples (see `develop::Kept`), most
     /// recently used first.
     kept: Vec<develop::Kept>,
+    /// Shadows/Highlights map building, created on first use.
+    mapper: Option<map::Mapper>,
+    /// Map bases on the device by the tone stage they were made with, most recently
+    /// used first (see `map::DeviceMap`).
+    maps: Vec<(crate::develop::stage_cache::ToneKey, DeviceMap)>,
     name: String,
 }
 struct Buffers {
@@ -215,6 +222,8 @@ impl Processor {
             presenter: None,
             resident: None,
             kept: Vec::new(),
+            mapper: None,
+            maps: Vec::new(),
             name: adapter.name.clone(),
         })
     }

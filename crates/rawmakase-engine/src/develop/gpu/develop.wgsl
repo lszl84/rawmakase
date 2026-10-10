@@ -12,7 +12,8 @@
 // Mask weights: one byte per mask, four per word, `P_MASK_WORDS` words per pixel.
 @group(0) @binding(6) var<storage, read> weights: array<u32>;
 // The tone stage's output per sample, kept between renders that change only the stages
-// after it: `size.z` 1 reads it, 2 computes and writes it, 0 neither (see `Kept`).
+// after it: `size.z` 1 reads it, 2 computes and writes it, 0 neither (see `Kept`). Then,
+// from `3 * size.x`, the colour before Exposure, as `size.w` says.
 @group(0) @binding(7) var<storage, read_write> toned: array<f32>;
 
 const TO_2020 = mat3x3<f32>(
@@ -316,12 +317,12 @@ fn luma2020(c: vec3<f32>) -> f32 {
     return 0.2627 * c.x + 0.678 * c.y + 0.0593 * c.z;
 }
 // local_tone::LocalToneMap::gain
-fn local_curve(i: u32, base: f32) -> f32 {
+// A Shadows or Highlights curve at `i` (`pixel_params::set_curves`) around `key`.
+fn local_curve(i: u32, key: f32, base: f32) -> f32 {
     let t = offset(i);
     if t < 0 {
         return 0.0;
     }
-    let key = p(i + 1u);
     let lo = p(i + 2u);
     let hi = p(i + 3u);
     let f = clamp((base - key - lo) / (hi - lo) * 48.0 - 0.5, 0.0, 47.0);
@@ -463,7 +464,8 @@ fn local_gain(pos: vec2<f32>, rgb: vec3<f32>) -> f32 {
         return exp2(family(0u, s, p(P_LOCAL_KEYS), base)
             + family(1u, h, p(P_LOCAL_KEYS + 1u), base) + clarity);
     }
-    return exp2(local_curve(P_SHADOWS, base) + local_curve(P_HIGHLIGHTS, base) + clarity);
+    return exp2(local_curve(P_SHADOWS, p(P_LOCAL_KEYS), base)
+        + local_curve(P_HIGHLIGHTS, p(P_LOCAL_KEYS + 1u), base) + clarity);
 }
 fn parametric(x: f32) -> f32 {
     if p(P_PARAMETRIC_ON) == 0.0 {
@@ -925,9 +927,9 @@ fn adjust(lab_in: vec3<f32>) -> vec3<f32> {
     }
     return lab;
 }
-fn process_pixel(sample: vec3<f32>, i: u32) -> vec3<f32> {
+fn process_pixel(i: u32) -> vec3<f32> {
     point_selection = -1.0;
-    let rgb = tone_stage(sample);
+    let rgb = tone_stage(i);
     if size.z == 2u {
         toned[i * 3u] = rgb.x;
         toned[i * 3u + 1u] = rgb.y;
@@ -939,22 +941,20 @@ fn process_pixel(sample: vec3<f32>, i: u32) -> vec3<f32> {
     }
     return after_tone(rgb, i);
 }
-// pipeline::tone_stage: camera sample to linear display RGB after the profile's tone curve.
-fn tone_stage(sample: vec3<f32>) -> vec3<f32> {
-    var wb = vec3(1.0);
-    if V_MASKS && masked {
-        let temp = vec3(p(P_LOCAL_WB), p(P_LOCAL_WB + 1u), p(P_LOCAL_WB + 2u));
-        let tint = vec3(p(P_LOCAL_WB + 3u), p(P_LOCAL_WB + 4u), p(P_LOCAL_WB + 5u));
-        wb = exp2(delta[L_TEMPERATURE] * temp + delta[L_TINT] * tint);
+// pipeline::tone_stage: sample `i` to linear display RGB after the profile's tone curve.
+fn tone_stage(i: u32) -> vec3<f32> {
+    var wide: vec3<f32>;
+    let kept = size.x * 3u + i * 3u;
+    if size.w == 1u {
+        wide = vec3(toned[kept], toned[kept + 1u], toned[kept + 2u]);
+    } else {
+        wide = before_exposure(vec3(samples[i * 3u], samples[i * 3u + 1u], samples[i * 3u + 2u]));
+        if size.w == 2u {
+            toned[kept] = wide.x;
+            toned[kept + 1u] = wide.y;
+            toned[kept + 2u] = wide.z;
+        }
     }
-    let c = sample * vec3(p(P_WB), p(P_WB + 1u), p(P_WB + 2u)) * wb;
-    var pro = matrix(P_CAMERA) * c;
-    let hue = offset(P_HUE);
-    if hue >= 0 {
-        pro = table_apply(table_at(P_HUE), pro, offset(P_HUE2), p(P_HUE_WEIGHT));
-    }
-    let color = calibrate(PRO_TO_RGB * pro * p(P_PROFILE_SCALE));
-    var wide = TO_2020 * color;
     if V_MASKS && masked {
         let exposure = exp2(delta[L_EXPOSURE]);
         let tint = exp2(vec3(delta[L_COLOR], delta[L_COLOR + 1u], delta[L_COLOR + 2u]));
@@ -971,6 +971,23 @@ fn tone_stage(sample: vec3<f32>) -> vec3<f32> {
     let y = max(luma2020(wide), 1e-8);
     wide = wide * y / y;
     return profile_finish(FROM_2020 * wide);
+}
+// The tone stage up to Exposure, in Rec. 2020.
+fn before_exposure(sample: vec3<f32>) -> vec3<f32> {
+    var wb = vec3(1.0);
+    if V_MASKS && masked {
+        let temp = vec3(p(P_LOCAL_WB), p(P_LOCAL_WB + 1u), p(P_LOCAL_WB + 2u));
+        let tint = vec3(p(P_LOCAL_WB + 3u), p(P_LOCAL_WB + 4u), p(P_LOCAL_WB + 5u));
+        wb = exp2(delta[L_TEMPERATURE] * temp + delta[L_TINT] * tint);
+    }
+    let c = sample * vec3(p(P_WB), p(P_WB + 1u), p(P_WB + 2u)) * wb;
+    var pro = matrix(P_CAMERA) * c;
+    let hue = offset(P_HUE);
+    if hue >= 0 {
+        pro = table_apply(table_at(P_HUE), pro, offset(P_HUE2), p(P_HUE_WEIGHT));
+    }
+    let color = calibrate(PRO_TO_RGB * pro * p(P_PROFILE_SCALE));
+    return TO_2020 * color;
 }
 // Everything after the tone stage: the Shadows/Highlights gain, the tone curves and the
 // colour stage.
@@ -1065,7 +1082,7 @@ fn develop(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_in
     } else if positions[i * 2u] > OUTSIDE {
         // Positions outside the photo are uploaded as OUTSIDE; Lightroom shows white there.
         load_delta(i);
-        out = process_pixel(vec3(samples[i * 3u], samples[i * 3u + 1u], samples[i * 3u + 2u]), i);
+        out = process_pixel(i);
     } else if size.z == 2u {
         toned[i * 3u] = OUTSIDE;
     }

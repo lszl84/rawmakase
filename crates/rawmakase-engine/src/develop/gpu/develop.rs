@@ -80,21 +80,60 @@ pub(super) struct Developer {
     /// Bound in place of the kept tone stage by passes that do not keep it.
     no_tone: wgpu::Buffer,
 }
-/// The tone stage's output for one set of samples and the recipe as the tone stage
-/// reads it (`PixelParams::tone`), so renders that change only the stages after it
-/// (the Basic tone sliders, curves, colour) read it instead of running it again.
+/// Two stages' output for one set of samples, kept on the device: the tone stage's,
+/// for the recipe as the tone stage reads it (`PixelParams::tone`), so renders that
+/// change only the stages after it (the Basic tone sliders, curves, colour) read it
+/// instead of running it again; and the colour before Exposure (white balance, camera
+/// matrix, HueSatMap, calibration), which an Exposure change reads.
 pub(super) struct Kept {
     pixels: wgpu::Buffer,
     positions: wgpu::Buffer,
-    recipe: crate::model::recipe::Recipe,
+    /// The tone stage's output, then the colour before Exposure, 3 values per sample.
     toned: wgpu::Buffer,
-    /// A submitted pass wrote `toned` for these samples and `recipe`. Until then it is
-    /// written again: a pass recorded but never submitted (a cancelled render) left it
-    /// as it was. `recipe` is the tone of the last render of these samples, written or
-    /// not.
+    tone: Stage,
+    linear: Stage,
+}
+/// One kept stage's state.
+#[derive(Clone)]
+struct Stage {
+    /// The recipe of the last render of these samples, as the stage reads it, written
+    /// or not.
+    recipe: crate::model::recipe::Recipe,
+    /// A submitted pass wrote the stage for these samples and `recipe`. Until then it
+    /// is written again: a pass recorded but never submitted (a cancelled render) left
+    /// it as it was.
     written: bool,
     /// The last recorded pass writes it; marked written once submitted.
     pending: bool,
+}
+impl Stage {
+    /// What a render with `recipe` does with the stage `kept` from earlier renders, if
+    /// any, and the stage it leaves.
+    fn next(kept: Option<&Stage>, recipe: crate::model::recipe::Recipe) -> (Keep, Self) {
+        let step = Keep::step(kept.map(|s| (s.recipe == recipe, s.written)));
+        let stage = Stage {
+            recipe,
+            written: step == Keep::Read,
+            pending: step == Keep::Write,
+        };
+        (step, stage)
+    }
+    /// The tone stage and the colour before Exposure for a render with the tone
+    /// stage's `recipe`, from the stages kept for its samples, if any.
+    fn plan(kept: Option<[&Stage; 2]>, recipe: &crate::model::recipe::Recipe) -> [(Keep, Self); 2] {
+        let tone = Self::next(kept.map(|k| k[0]), recipe.clone());
+        // Exposure applies after the colour, so it is left out of its recipe.
+        let before_exposure = crate::model::recipe::Recipe {
+            exposure: 0.,
+            ..recipe.clone()
+        };
+        let linear = match (kept, tone.0) {
+            // Reading the tone stage leaves the colour before it as it was.
+            (Some([_, linear]), Keep::Read) => (Keep::Run, linear.clone()),
+            _ => Self::next(kept.map(|k| k[1]), before_exposure),
+        };
+        [tone, linear]
+    }
 }
 /// Uploaded sample sets kept, and their device memory budget.
 const UPLOADS: usize = 3;
@@ -256,8 +295,8 @@ impl Developer {
         }
     }
 }
-/// What a develop pass does with the kept tone stage of its samples; the value is the
-/// shader's `size.z`.
+/// What a develop pass does with a kept stage of its samples; the value is the
+/// shader's `size.z` for the tone stage and `size.w` for the colour before Exposure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Keep {
     /// Runs the tone stage.
@@ -282,11 +321,13 @@ impl Keep {
 }
 /// Sample sets whose tone stage is kept: the Fit and its draft, and a 100% region.
 const KEPT: usize = 3;
-/// Marks the kept tone stages written once the pass that writes them is submitted.
+/// Marks the kept stages written once the pass that writes them is submitted.
 pub(super) fn submitted(kept: &mut [Kept]) {
-    for k in kept.iter_mut().filter(|k| k.pending) {
-        k.pending = false;
-        k.written = true;
+    for s in kept.iter_mut().flat_map(|k| [&mut k.tone, &mut k.linear]) {
+        if s.pending {
+            s.pending = false;
+            s.written = true;
+        }
     }
 }
 impl Processor {
@@ -310,25 +351,23 @@ impl Processor {
                 (u.pixels.clone(), u.positions.clone(), u.output.clone())
             }
         };
-        // 1 reads the kept tone stage, 2 runs it and keeps it, 0 runs it.
-        let (mode, toned) = match &params.tone {
+        // The kept tone stage and colour before Exposure (`Keep`, as `size.z`, `size.w`).
+        let (mode, linear, toned) = match &params.tone {
             Some(recipe) if params.weights.is_empty() => {
-                let bytes = n * 12;
+                let bytes = n * 24;
                 // The entry for these samples, most recently used first.
                 let found = self
                     .kept
                     .iter()
                     .position(|k| k.pixels == pixels && k.positions == positions);
-                let entry = found.map(|i| self.kept.remove(i));
-                let step = Keep::step(
-                    entry
-                        .as_ref()
-                        .filter(|k| k.toned.size() >= bytes)
-                        .map(|k| (k.recipe == *recipe, k.written)),
-                );
+                let entry = found
+                    .map(|i| self.kept.remove(i))
+                    .filter(|k| k.toned.size() >= bytes);
+                let [(tone, tone_stage), (linear, linear_stage)] =
+                    Stage::plan(entry.as_ref().map(|k| [&k.tone, &k.linear]), recipe);
                 let toned = match entry {
-                    Some(k) if k.toned.size() >= bytes => k.toned,
-                    _ => device.create_buffer(&wgpu::BufferDescriptor {
+                    Some(k) => k.toned,
+                    None => device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("Kept tone stage"),
                         size: bytes,
                         usage: wgpu::BufferUsages::STORAGE,
@@ -340,16 +379,15 @@ impl Processor {
                     Kept {
                         pixels: pixels.clone(),
                         positions: positions.clone(),
-                        recipe: recipe.clone(),
                         toned: toned.clone(),
-                        written: step == Keep::Read,
-                        pending: step == Keep::Write,
+                        tone: tone_stage,
+                        linear: linear_stage,
                     },
                 );
                 self.kept.truncate(KEPT);
-                (step as u32, Some(toned))
+                (tone as u32, linear as u32, Some(toned))
             }
-            _ => (0, None),
+            _ => (0, 0, None),
         };
         let developer = self.developer.get_or_insert_with(|| Developer::new(device));
         let pipeline = developer.pipeline(device, Variant::of(params, mode == Keep::Read as u32));
@@ -361,8 +399,38 @@ impl Processor {
                 usage: wgpu::BufferUsages::STORAGE,
             })
         };
-        let params_buffer = storage("Develop parameters", &params.params);
-        let tables = storage("Develop tables", &params.tables);
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Develop parameters"),
+            contents: bytemuck::cast_slice(&params.uploaded()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let tables = match &params.map {
+            None => storage("Develop tables", &params.tables),
+            // The map's coefficients follow the tables, and its keys go to the
+            // parameters; it was built by an earlier submission.
+            Some(map) => {
+                let at = params.tables.len() as u64 * 4;
+                let tables = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Develop tables"),
+                    size: at + map.cells() as u64 * 8,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                if at > 0 {
+                    self.queue
+                        .write_buffer(&tables, 0, bytemuck::cast_slice(&params.tables));
+                }
+                encoder.copy_buffer_to_buffer(&map.ab, 0, &tables, at, map.cells() as u64 * 8);
+                encoder.copy_buffer_to_buffer(
+                    &map.keys,
+                    0,
+                    &params_buffer,
+                    PixelParams::keys_byte_offset(),
+                    8,
+                );
+                tables
+            }
+        };
         let weights = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Mask weights"),
             contents: bytemuck::cast_slice(if params.weights.is_empty() {
@@ -377,7 +445,7 @@ impl Processor {
         let (gx, gy) = (groups.min(max), groups.div_ceil(groups.min(max)));
         let size = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Develop size"),
-            contents: bytemuck::cast_slice(&[n as u32, gx, mode, 0]),
+            contents: bytemuck::cast_slice(&[n as u32, gx, mode, linear]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let entries: Vec<_> = [
@@ -499,7 +567,10 @@ impl Processor {
         ensure!(
             n * 12 <= limits.max_storage_buffer_binding_size
                 && n * 12 <= limits.max_buffer_size
-                && (params.tables.len() as u64 * 4) <= limits.max_storage_buffer_binding_size,
+                && ((params.tables.len() + 2 * params.map.as_ref().map_or(0, |m| m.cells()))
+                    as u64
+                    * 4)
+                    <= limits.max_storage_buffer_binding_size,
             "Region exceeds GPU buffer limits"
         );
         ensure!(
@@ -522,6 +593,7 @@ impl Processor {
             if let Some(d) = &mut self.developer {
                 d.samples.clear();
             }
+            self.maps.clear();
             self.release_resident();
             anyhow::bail!("{error}");
         }
@@ -574,7 +646,44 @@ impl Processor {
 
 #[cfg(test)]
 mod tests {
-    use super::{Keep, Variant};
+    use super::{Keep, Stage, Variant};
+
+    /// While Exposure moves, every tone is new but the colour before it is not: it is
+    /// kept from the second render and read after that; the tone stage is kept once
+    /// the slider rests. Reading the tone stage leaves the colour as it was.
+    #[test]
+    fn an_exposure_drag_reads_the_colour_kept_before_exposure() {
+        let recipe = |exposure| crate::model::recipe::Recipe {
+            exposure,
+            ..Default::default()
+        };
+        // Each render submitted, so what it writes is written.
+        let render = |kept: &mut Option<[Stage; 2]>, exposure| {
+            let [(tone, t), (linear, l)] =
+                Stage::plan(kept.as_ref().map(|[t, l]| [t, l]), &recipe(exposure));
+            let submit = |mut s: Stage| {
+                s.written |= s.pending;
+                s.pending = false;
+                s
+            };
+            *kept = Some([submit(t), submit(l)]);
+            (tone, linear)
+        };
+        let mut kept = None;
+        assert_eq!(render(&mut kept, 0.), (Keep::Run, Keep::Run));
+        assert_eq!(render(&mut kept, 0.1), (Keep::Run, Keep::Write));
+        assert_eq!(render(&mut kept, 0.2), (Keep::Run, Keep::Read));
+        assert_eq!(render(&mut kept, 0.3), (Keep::Run, Keep::Read));
+        // The slider rests: Contrast moves.
+        assert_eq!(render(&mut kept, 0.3), (Keep::Write, Keep::Read));
+        assert_eq!(render(&mut kept, 0.3), (Keep::Read, Keep::Run));
+        assert_eq!(render(&mut kept, 0.4), (Keep::Run, Keep::Read));
+        // White balance changes the colour too.
+        let mut warmer = recipe(0.4);
+        warmer.wb[0] += 0.1;
+        let [(tone, _), (linear, _)] = Stage::plan(kept.as_ref().map(|[t, l]| [t, l]), &warmer);
+        assert_eq!((tone, linear), (Keep::Run, Keep::Run));
+    }
     use crate::develop::pipeline::pixel_params::PixelParams;
 
     /// Each colour stage on its own compiles the colour code into the pass, and a

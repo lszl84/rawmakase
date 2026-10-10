@@ -256,6 +256,37 @@ Per change (median of 16, two runs):
 | Whites | 23–24 ms | 13–14 ms |
 | Blacks | 24–25 ms | 13–14 ms |
 
+An Exposure change builds the map again, for the draft and for the full render, which
+use different pyramid levels. Each build was about 25 ms: the reduced photo toned on
+the GPU and read back (6 ms), then the guided filter and keys on the CPU (13 ms). The
+map's base is now built on the device (`gpu/map.rs`): log luminance, box means that
+sum their windows directly, the coefficients, and both keys by a four-round radix
+select of the luminance's bits. It stays there, keyed like the CPU's, and the develop
+pass copies its coefficients after its tables and its keys into its parameters, so
+nothing is read back or uploaded. A hardware test compares it with the CPU's base:
+the keys agree to 1e-7, a to 3e-5 and b to 3e-4, both rounding the variance in f32.
+With the measured Clarity, which needs the base on the CPU, the map is built there as
+before.
+
+The tone stage runs white balance, the camera matrix, HueSatMap and calibration
+before Exposure, and HueSatMap alone took about 10 ms of a full Fit. The kept tone
+buffer now also holds that colour before Exposure, keyed by the tone stage's recipe
+without Exposure and written from its second render, so an Exposure drag reads it and
+runs only the exposure ramp, LookTable and tone curve.
+
+Per change (median of 16, two runs):
+
+| Slider | Fit | Draft |
+| --- | ---: | ---: |
+| Exposure | 41–44 ms | 24 ms |
+| Contrast | 24–28 ms | 12 ms |
+| Highlights | 25–27 ms | 12 ms |
+| Shadows | 25–28 ms | 12 ms |
+| Whites | 23–26 ms | 12–14 ms |
+| Blacks | 24–32 ms | 11–13 ms |
+
+The other sliders did not change; these runs were noisier than the previous ones.
+
 ## GPU develop stage
 
 `crates/rawmakase-engine/src/develop/gpu/develop.wgsl` ports the per-pixel stage (`process_pixel`) of the

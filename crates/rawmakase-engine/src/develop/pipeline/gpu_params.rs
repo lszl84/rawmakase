@@ -41,6 +41,22 @@ pub(crate) fn gpu_pixel_params(
         return pixel_params::measured_params(im, r, measures, false).map(keep);
     }
     let tone = pixel_params::measured_params(im, r, measures, true)?;
+    let sliders = crate::develop::local_tone::Sliders::of(r);
+    // The map's base is built and kept on the device, unless the measured Clarity
+    // needs it on the CPU.
+    if sliders.clarity == 0.
+        && let Some(small) = im.reduced
+    {
+        let key = ToneKey::new(toned, r);
+        let map = backend.run(cancel, |gpu| {
+            gpu.scoped(|gpu| gpu.device_map(key, small, &tone))
+        });
+        if let Some(map) = map {
+            let source = [im.width, im.height];
+            let p = pixel_params::with_device_map(tone, map, source, sliders);
+            return Some(keep(p));
+        }
+    }
     let base = cache.maps.get_or_try(
         ToneKey::new(toned, r),
         crate::develop::local_tone::MapBase::bytes,
@@ -72,10 +88,7 @@ pub(crate) fn gpu_pixel_params(
         // As before the map was kept: the CPU builds what the GPU could not.
         return pixel_params::pixel_params(im, r);
     };
-    let map = crate::develop::local_tone::LocalToneMap::from_base(
-        &base,
-        crate::develop::local_tone::Sliders::of(r),
-    );
+    let map = crate::develop::local_tone::LocalToneMap::from_base(&base, sliders);
     Some(keep(pixel_params::with_map(tone, &map)))
 }
 /// Lens correction for `gpu/local.wgsl`, from `S_LENS` to `S_VIGNETTING_AMOUNT`, with
